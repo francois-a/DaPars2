@@ -1,4 +1,6 @@
 #!/usr/bin/python3
+import pandas as pd
+import numpy as np
 import os
 import sys
 import getopt
@@ -9,91 +11,74 @@ import subprocess
 
 
 def annotation_prepare_3UTR_extraction(gene_bed_file, gene_symbol_map_kfXref_file, output_utr_file):
-    """"""
+    """Parse UTRs (first/last exon depending on strand) from annotation"""
+
+    # load gene symbol lookup
+    refseq_trapt_gene_symbol_dict = pd.read_csv(gene_symbol_map_kfXref_file,
+                sep='\t', index_col=0, squeeze=True).to_dict()
+
     with open(output_utr_file, 'w') as output_write:
-
-        refseq_trapt_gene_symbol_dict = {}
-        num_line = 0
-        for line in open(gene_symbol_map_kfXref_file, 'r'):
-            if num_line > 0:
-                fields = line.strip('\n').strip('\r').split('\t')
-                gene_symbol = fields[1]
-                refseq_transcript_id = fields[0]
-                refseq_trapt_gene_symbol_dict[refseq_transcript_id] = gene_symbol
-            else:
-                num_line += 1
-
         scanned_3UTR_list = []
-        num_saved = 0
         for line in open(gene_bed_file, 'r'):
             fields = line.strip('\n').split('\t')
             refseq_id = fields[3]
-            if '_' not in fields[0]:
+            if '_' not in fields[0]:  # skip alternate contigs
 
-                if refseq_id not in refseq_trapt_gene_symbol_dict:
-                    gene_symbol = "NA"
-                else:
-                    gene_symbol = refseq_trapt_gene_symbol_dict[refseq_id]
-
-                UTR_id = [refseq_id, gene_symbol, fields[0], fields[5]]
-                UTR_id_new = '|'.join(UTR_id)
+                gene_symbol = refseq_trapt_gene_symbol_dict.get(refseq_id, 'NA')
+                # UTR ID: gene ID, gene name, chr, strand
+                UTR_id = '|'.join([refseq_id, gene_symbol, fields[0], fields[5]])
                 curr_strand = fields[5]
+                gene_start = int(fields[1])
+                # UTR: last exon of the gene
                 if curr_strand == "+":
-                    UTR_end = fields[2]
-                    gene_start = int(fields[1])
                     UTR_start = str(gene_start + int(fields[-1].strip(',').split(',')[-1]) + 1)  # 1base
+                    UTR_end = fields[2]  # end of the gene
                 elif curr_strand == "-":
-                    gene_start = int(fields[1])
                     UTR_start = str(gene_start + 1)  # 1base
                     UTR_end   = str(gene_start + int(fields[10].split(',')[0]))  # 1base, included
 
+                # UTR: chr_start_end_strand --> only retain first occurrence
                 this_UTR = fields[0] + UTR_start + UTR_end + curr_strand
                 if this_UTR not in scanned_3UTR_list:
-                    write_line = [fields[0], UTR_start, UTR_end, UTR_id_new, '0', curr_strand]
-                    output_write.writelines('\t'.join(write_line) + '\n')
+                    # chr, start, end, id/name/chr/strand, '0', strand
+                    output_write.writelines('\t'.join([fields[0], UTR_start, UTR_end, UTR_id, '0', curr_strand]) + '\n')
                     scanned_3UTR_list.append(this_UTR)
-                    num_saved += 1
 
-    print(f"Total extracted 3' UTR: {num_saved}")
+    print(f"Total extracted 3' UTR: {len(scanned_3UTR_list)}")
 
 
 def UTRs_subtract_refine(UTRs_all):
     """"""
     strand_info = UTRs_all[0].strip('\n').split('\t')[-1]
     if strand_info == '+':
-        all_pos = []
-        for curr_line in UTRs_all:
-            left_pos = curr_line.strip('\n').split('\t')[1]
-            all_pos.append(int(left_pos))
-        selected_UTR = UTRs_all[all_pos.index(min(all_pos))]
+        # first start position
+        all_pos = np.array([int(curr_line.strip('\n').split('\t')[1]) for curr_line in UTRs_all])
+        selected_UTR = UTRs_all[all_pos.argmin()]
     else:
-        all_pos = []
-        for curr_line in UTRs_all:
-            left_pos = curr_line.strip('\n').split('\t')[2]
-            all_pos.append(int(left_pos))
-        selected_UTR = UTRs_all[all_pos.index(max(all_pos))]
+        # last end position
+        all_pos = np.array([int(curr_line.strip('\n').split('\t')[2]) for curr_line in UTRs_all])
+        selected_UTR = UTRs_all[all_pos.argmax()]
     return selected_UTR
 
 
 def subtract_different_strand_overlap(input_gene_bed_file, output_utr_file):
     """"""
     with tempfile.NamedTemporaryFile() as f:
-        # bedtools
-        subprocess.check_call(f'subtractBed -a {input_gene_bed_file} -b {input_gene_bed_file} -S > {f.name}', shell=True)
+        # subtract regions that overlap on opposite strands
+        subprocess.check_call(f'bedtools subtract -a {input_gene_bed_file} -b {input_gene_bed_file} -S > {f.name}', shell=True)
 
+        # group UTRs by refseq ID -- not optimal; overlapping transcripts in example data have different IDs
         read_subtract_result_dict = defaultdict(list)
         for line in open(f.name, 'r'):
-            transcript_id = line.split('\t')[3].split('|')[0]
+            transcript_id = line.split('\t')[3].split('|')[0]  # UTR_id -> refseq_id
             read_subtract_result_dict[transcript_id].append(line)
 
-        output_utr_write = open(output_utr_file, 'w')
-        for curr_trans_id in read_subtract_result_dict:
-            curr_3UTRs = read_subtract_result_dict[curr_trans_id]
-            if len(curr_3UTRs) == 1:
-                output_utr_write.writelines(curr_3UTRs[0])
-            else:
-                output_utr_write.writelines(UTRs_subtract_refine(curr_3UTRs))
-        output_utr_write.close()
+        with open(output_utr_file, 'w') as output_utr_write:
+            for _, curr_3UTRs in read_subtract_result_dict.items():
+                if len(curr_3UTRs) == 1:
+                    output_utr_write.writelines(curr_3UTRs[0])
+                else:
+                    output_utr_write.writelines(UTRs_subtract_refine(curr_3UTRs))
 
 
 if __name__ == '__main__':
